@@ -1,11 +1,147 @@
-const componentRelationships = [];
+class ComponentParser {
+  constructor() {
+    this.componentCounts = {};
+    const callback = this.sendNewComponentData.bind(this);
+    window.addEventListener("SvelteRegisterComponent", callback);
+  }
+
+  sendNewComponentData(event) {
+    const {
+      id,
+      parsedState,
+      tagName,
+      instance,
+      target,
+      newStoreVariables,
+      component,
+    } = this.parseNewComponent(event.detail);
+
+    const storeParsedComponent = new CustomEvent("storeParsedComponent", {
+      detail: {
+        id,
+        parsedState,
+        tagName,
+        instance,
+        target,
+      },
+    });
+
+    const updateStoreVariables = new CustomEvent("updateStoreVariables", {
+      detail: { newStoreVariables },
+    });
+
+    const updateComponentObject = new CustomEvent("updateComponentObject", {
+      detail: {
+        component,
+        id,
+        tagName,
+      },
+    });
+
+    window.dispatchEvent(storeParsedComponent);
+    window.dispatchEvent(updateStoreVariables);
+    window.dispatchEvent(updateComponentObject);
+  }
+
+  parseNewComponent(eventDetail) {
+    const { component, tagName, options } = eventDetail;
+    const instance = this.assignComponentInstance(tagName);
+    const id = tagName + instance;
+    console.log(id);
+    const { parsedState, newStoreVariables } =
+      this.parseComponentState(component);
+    const target = this.assignComponentTarget(options);
+
+    return {
+      id,
+      parsedState,
+      tagName,
+      instance,
+      target,
+      component,
+      newStoreVariables,
+    };
+  }
+
+  assignComponentInstance(tagName) {
+    this.componentCounts[tagName] = (this.componentCounts[tagName] || 0) + 1;
+    return this.componentCounts[tagName];
+  }
+
+  assignComponentTarget(options) {
+    return options.target ? options.target.nodeName + options.target.id : null;
+  }
+
+  parseComponentState(component) {
+    const state = this.getComponentState(component);
+
+    const parsedState = {};
+    const newStoreVariables = {};
+    for (let variableName in state) {
+      const value = state[variableName];
+      if (type_of(value) === "writable_store") {
+        newStoreVariables[variableName] = value;
+      } else if (
+        typeof value !== "function" &&
+        type_of(value) !== "non-writable_store"
+      ) {
+        parsedState[variableName] = this.parseState(value, variableName);
+      }
+    }
+
+    return { parsedState, newStoreVariables };
+  }
+
+  getComponentState(component) {
+    const captureStateFunc = component.$capture_state;
+    let state = captureStateFunc ? captureStateFunc() : {};
+    // if capture_state produces an empty object, may need to use ctx instead (older version of Svelte)
+    if (state && !Object.keys(state).length) {
+      if (component.$$.ctx.constructor.name === "Object") {
+        state = deepClone(component.$$.ctx);
+      }
+    }
+    return state;
+  }
+
+  parseState(element, name = null) {
+    let value;
+    if (element === null) {
+      value = element;
+    } else if (typeof element === "function") {
+      value = element.toString();
+    } else if (typeof element === "object") {
+      if (element.constructor) {
+        if (
+          element.constructor.name === "Object" ||
+          element.constructor.name === "Array"
+        ) {
+          value = {};
+          for (let i in element) {
+            value[i] = this.parseState(element[i], i);
+          }
+        } else {
+          value = "<" + element.constructor.name + ">";
+        }
+      } else {
+        value = "Unknown Object";
+      }
+    } else {
+      value = element;
+    }
+
+    return {
+      value,
+      name,
+    };
+  }
+}
 
 let slicer = (() => {
   const variables = {
     components: [], // parsed component data to be sent in snapshot
     deletedNodes: [], // parsed data re. deleted nodes to be sent in snapshot
     insertedNodes: [], // parsed data re. inserted nodes to be sent in snapshot
-    componentCounts: {}, // count of components with shared tagnames for instance numbering
     componentObject: {}, // actual component instances for injecting state
     listeners: {}, // data re. app's event listeners to help with snapshot labeling
     stateHistory: [], // copies of raw state snapshots to help recreate previous states
@@ -49,8 +185,9 @@ let slicer = (() => {
   };
 })();
 
+new ComponentParser();
+
 function addSvelteDomListeners(root) {
-  root.addEventListener("SvelteRegisterComponent", registerNewComponent);
   root.addEventListener("SvelteDOMInsert", insertNewNode);
   root.addEventListener("SvelteDOMRemove", removeNode);
   root.addEventListener("SvelteDOMAddEventListener", addEventListener);
@@ -67,126 +204,56 @@ function setup() {
   window.addEventListener("message", parseDevToolMessage);
 }
 
-function registerNewComponent(e) {
-  const { id, state, tagName, instance, target, component } = parseNewComponent(
-    e.detail
-  );
-  slicer.add("components", { id, state, tagName, instance, target });
+window.addEventListener("storeParsedComponent", storeParsedComponent);
+
+function storeParsedComponent(event) {
+  const { id, parsedState, tagName, instance, target } = event.detail;
+  slicer.add("components", { id, parsedState, tagName, instance, target });
+}
+
+window.addEventListener("updateStoreVariables", updateStoreVariables);
+
+function updateStoreVariables(event) {
+  const { newStoreVariables } = event.detail;
+  const variables = Object.entries(newStoreVariables);
+  variables.forEach(([key, value]) => {
+    slicer.update("storeVariables", value, key);
+  });
+}
+
+window.addEventListener("updateComponentObject", updateComponentObject);
+
+function updateComponentObject(event) {
+  const { component, id, tagName } = event.detail;
   slicer.update("componentObject", { component, tagName }, id);
-  componentRelationships.push({ id, tagName });
 }
 
-function parseNewComponent(detail) {
-  const { component, tagName, options } = detail;
-  const instance = assignComponentInstance(tagName);
-  const id = tagName + instance;
-  const state = parseComponentState(component);
-  const target = assignComponentTarget(options);
+const deepClone = (inObject) => {
+  let outObject, value, key;
 
-  return {
-    id,
-    state,
-    tagName,
-    instance,
-    target,
-    component,
-  };
-}
-
-function assignComponentInstance(tagName) {
-  let instance = 0;
-  if (slicer.has("componentCounts", tagName)) {
-    instance = slicer.getValue("componentCounts", tagName) + 1;
-  }
-  slicer.update("componentCounts", instance, tagName);
-  return instance;
-}
-
-function assignComponentTarget(options) {
-  return options.target ? options.target.nodeName + options.target.id : null;
-}
-
-function parseState(element, name = null) {
-  let value;
-  if (element === null) {
-    value = element;
-  } else if (typeof element === "function") {
-    value = element.toString();
-  } else if (typeof element === "object") {
-    if (element.constructor) {
-      if (
-        element.constructor.name === "Object" ||
-        element.constructor.name === "Array"
-      ) {
-        value = {};
-        for (let i in element) {
-          value[i] = parseState(element[i], i);
-        }
-      } else {
-        value = "<" + element.constructor.name + ">";
-      }
-    } else {
-      value = "Unknown Object";
-    }
-  } else {
-    value = element;
+  if (typeof inObject !== "object" || inObject === null) {
+    return inObject; // Return the value if inObject is not an object
   }
 
-  return {
-    value,
-    name,
-  };
-}
-
-function parseComponentState(component) {
-  const state = getComponentState(component);
-
-  const parsedState = {};
-  for (let variableName in state) {
-    const value = state[variableName];
-    if (type_of(value) === "writable_store") {
-      slicer.update("storeVariables", value, variableName);
-    } else if (
-      typeof value !== "function" &&
-      type_of(value) !== "non-writable_store"
-    ) {
-      parsedState[variableName] = parseState(value, variableName);
-    }
+  if (
+    inObject.constructor.name !== "Object" &&
+    inObject.constructor.name !== "Array"
+  ) {
+    return inObject; // Return the value if inObject is not an object
   }
-  return parsedState;
-}
 
-function getComponentState(component) {
-  const captureStateFunc = component.$capture_state;
-  let state = captureStateFunc ? captureStateFunc() : {};
-  // if capture_state produces an empty object, may need to use ctx instead (older version of Svelte)
-  if (state && !Object.keys(state).length) {
-    if (component.$$.ctx.constructor.name === "Object") {
-      state = deepClone(component.$$.ctx);
-    }
-  }
-  return state;
-}
+  // Create an array or object to hold the values
+  outObject = Array.isArray(inObject) ? [] : {};
 
-function type_of(value) {
-  let type = Object.prototype.toString.call(value).slice(8, -1).toLowerCase();
-  if (type === "object") {
-    // check if it's a store variable
-    if (value.hasOwnProperty("subscribe")) {
-      // check if it's a writable store
-      if (value.hasOwnProperty("set") && value.hasOwnProperty("update")) {
-        type = "writable_store";
-      } else {
-        type = "non-writable_store";
-      }
-    } else {
-      if (value.constructor.name !== "Object") {
-        type = "unknown";
-      }
-    }
+  for (key in inObject) {
+    value = inObject[key];
+
+    // Recursively (deep) copy for nested objects, including arrays
+    outObject[key] = deepClone(value);
   }
-  return type;
-}
+
+  return outObject;
+};
 
 function removeNode(e) {
   const { node } = e.detail;
@@ -206,7 +273,6 @@ function insertNewNode(e) {
     const componentName = getComponentName(node);
     let componentId;
     if (e.detail.hasOwnProperty("anchor") && e.detail.anchor === undefined) {
-      console.log("parent node being named");
       componentId = componentName;
     } else {
       componentId = assignParent(node, target);
@@ -283,33 +349,6 @@ function getComponentName(node) {
 
   return fileName.slice(fileName.lastIndexOf("/") + 1, -7);
 }
-
-const deepClone = (inObject) => {
-  let outObject, value, key;
-
-  if (typeof inObject !== "object" || inObject === null) {
-    return inObject; // Return the value if inObject is not an object
-  }
-
-  if (
-    inObject.constructor.name !== "Object" &&
-    inObject.constructor.name !== "Array"
-  ) {
-    return inObject; // Return the value if inObject is not an object
-  }
-
-  // Create an array or object to hold the values
-  outObject = Array.isArray(inObject) ? [] : {};
-
-  for (key in inObject) {
-    value = inObject[key];
-
-    // Recursively (deep) copy for nested objects, including arrays
-    outObject[key] = deepClone(value);
-  }
-
-  return outObject;
-};
 
 function updateLabel(nodeId, event) {
   const listener = slicer.getValue("listeners", nodeId + event);
@@ -427,6 +466,7 @@ function sendSnapshot(snapshotData, type) {
     snapshotLabel,
     stateObject,
   } = snapshotData;
+
   window.postMessage({
     source: "panel.js",
     type,
@@ -467,6 +507,25 @@ function captureRawAppState() {
     appState[component] = state;
   }
   return appState;
+}
+
+function parseComponentState(component) {
+  const state = getComponentState(component);
+
+  const parsedState = {};
+  const newStoreVariables = {};
+  for (let variableName in state) {
+    const value = state[variableName];
+    if (type_of(value) === "writable_store") {
+      newStoreVariables[variableName] = value;
+    } else if (
+      typeof value !== "function" &&
+      type_of(value) !== "non-writable_store"
+    ) {
+      parsedState[variableName] = parseState(value, variableName);
+    }
+  }
+  return parsedState;
 }
 
 function captureParsedAppState() {
@@ -571,4 +630,68 @@ function parseDevToolMessage(event) {
     const { index, path, clearType } = event.data;
     clearSnapshots(index, path, clearType);
   }
+}
+
+function type_of(value) {
+  let type = Object.prototype.toString.call(value).slice(8, -1).toLowerCase();
+  if (type === "object") {
+    // check if it's a store variable
+    if (value.hasOwnProperty("subscribe")) {
+      // check if it's a writable store
+      if (value.hasOwnProperty("set") && value.hasOwnProperty("update")) {
+        type = "writable_store";
+      } else {
+        type = "non-writable_store";
+      }
+    } else {
+      if (value.constructor.name !== "Object") {
+        type = "unknown";
+      }
+    }
+  }
+  return type;
+}
+
+function getComponentState(component) {
+  const captureStateFunc = component.$capture_state;
+  let state = captureStateFunc ? captureStateFunc() : {};
+  // if capture_state produces an empty object, may need to use ctx instead (older version of Svelte)
+  if (state && !Object.keys(state).length) {
+    if (component.$$.ctx.constructor.name === "Object") {
+      state = deepClone(component.$$.ctx);
+    }
+  }
+  return state;
+}
+
+function parseState(element, name = null) {
+  let value;
+  if (element === null) {
+    value = element;
+  } else if (typeof element === "function") {
+    value = element.toString();
+  } else if (typeof element === "object") {
+    if (element.constructor) {
+      if (
+        element.constructor.name === "Object" ||
+        element.constructor.name === "Array"
+      ) {
+        value = {};
+        for (let i in element) {
+          value[i] = parseState(element[i], i);
+        }
+      } else {
+        value = "<" + element.constructor.name + ">";
+      }
+    } else {
+      value = "Unknown Object";
+    }
+  } else {
+    value = element;
+  }
+
+  return {
+    value,
+    name,
+  };
 }
