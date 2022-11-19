@@ -1,3 +1,5 @@
+const componentRelationships = [];
+
 let slicer = (() => {
   const variables = {
     components: [], // parsed component data to be sent in snapshot
@@ -71,6 +73,7 @@ function registerNewComponent(e) {
   );
   slicer.add("components", { id, state, tagName, instance, target });
   slicer.update("componentObject", { component, tagName }, id);
+  componentRelationships.push({ id, tagName });
 }
 
 function parseNewComponent(detail) {
@@ -200,8 +203,15 @@ function insertNewNode(e) {
   const { node, target } = e.detail;
   if (node.__svelte_meta) {
     const id = slicer.increment("node_id");
-    const componentName = getComponentName(node.__svelte_meta.loc.file);
-    slicer.setNodeData(node, { id, componentName });
+    const componentName = getComponentName(node);
+    let componentId;
+    if (e.detail.hasOwnProperty("anchor") && e.detail.anchor === undefined) {
+      console.log("parent node being named");
+      componentId = componentName;
+    } else {
+      componentId = assignParent(node, target);
+    }
+    slicer.setNodeData(node, { id, componentName, componentId });
     slicer.add("insertedNodes", {
       target: slicer.getNodeData(target)
         ? slicer.getNodeData(target).id
@@ -210,6 +220,31 @@ function insertNewNode(e) {
       component: componentName,
       loc: node.__svelte_meta.loc.char,
     });
+  }
+}
+
+function assignParent(node, target) {
+  const nodeComponentName = getComponentName(node);
+  const targetNode = slicer.getNodeData(target);
+  const targetComponentName = targetNode.componentName;
+  const parsedComponents = slicer.get("components");
+  if (nodeComponentName !== targetComponentName) {
+    for (let component of parsedComponents) {
+      if (component.tagName === nodeComponentName) {
+        // this node belongs to the next instance of this component
+        if (component.parentId === undefined) {
+          component.parentName = targetNode.componentId;
+          component.parentId = targetNode.id;
+          return component.id;
+        }
+        // this node belongs to an instance who's parent is already defined
+        else if (component.parentId === targetNode.id) {
+          return component.id;
+        }
+      }
+    }
+  } else {
+    return targetNode.componentId;
   }
 }
 
@@ -238,14 +273,15 @@ function addEventListener(e) {
   }
 }
 
-function getComponentName(file) {
-  let tagName;
-  if (file.indexOf("/") === -1) {
-    tagName = file.slice(file.lastIndexOf("\\\\") + 1, -7);
-  } else {
-    tagName = file.slice(file.lastIndexOf("/") + 1, -7);
+function getComponentName(node) {
+  const fileName = node.__svelte_meta.loc.file;
+
+  // check if this is a Windows based file naming, ie. \ instead of /
+  if (fileName.indexOf("/") === -1) {
+    return fileName.slice(fileName.lastIndexOf("\\\\") + 1, -7);
   }
-  return tagName;
+
+  return fileName.slice(fileName.lastIndexOf("/") + 1, -7);
 }
 
 const deepClone = (inObject) => {
